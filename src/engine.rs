@@ -5,6 +5,7 @@
 //! with optional ML-based detection for catching attack variations.
 
 use anyhow::Result;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use tracing::{debug, info};
@@ -397,15 +398,30 @@ impl WafEngine {
             self.check_raw_and_decoded(q, "query", true, &mut all_detections);
         }
 
-        // Check headers
+        // Header values are often percent-encoded too (a cookie, a Referer).
+        // `+` is left as it is, as in the path: outside a query it is not a
+        // space, and it is common in tokens such as base64.
         for (name, values) in headers {
             let location = format!("header:{}", name);
             for value in values {
-                all_detections.extend(self.check(value, &location));
+                self.check_raw_and_decoded(value, &location, false, &mut all_detections);
             }
         }
 
         all_detections
+    }
+
+    /// Check a request body as sent and, if it differs, URL-decoded.
+    ///
+    /// A form body (`application/x-www-form-urlencoded`) is encoded like a
+    /// query string, so it is decoded the same way, with `+` as a space. This
+    /// is done for every body: a body event does not carry the request's
+    /// `Content-Type`. The decoded form only adds matches, since the body is
+    /// also checked as sent. A rule that matches both forms is counted once.
+    pub fn check_body(&self, body: &str) -> Vec<Detection> {
+        let mut detections = Vec::new();
+        self.check_raw_and_decoded(body, "body", true, &mut detections);
+        detections
     }
 
     /// Check `value` as sent and, if it differs, its URL-decoded form.
@@ -417,11 +433,10 @@ impl WafEngine {
         out: &mut Vec<Detection>,
     ) {
         let raw = self.check(value, location);
-        let decoded = url_decode_fully(value, plus_is_space);
-        if decoded == value {
+        let Cow::Owned(decoded) = url_decode_fully(value, plus_is_space) else {
             out.extend(raw);
             return;
-        }
+        };
         let mut seen: std::collections::HashSet<u32> = raw.iter().map(|d| d.rule_id).collect();
         out.extend(raw);
         for d in self.check(&decoded, location) {
@@ -886,16 +901,29 @@ fn url_decode(input: &str, plus_is_space: bool) -> String {
 
 /// Decode until the value stops changing (at most three rounds), so that
 /// double-encoded payloads such as `%2527` are seen as `'`.
-fn url_decode_fully(input: &str, plus_is_space: bool) -> String {
-    let mut current = input.to_string();
-    for _ in 0..3 {
+///
+/// A value that decoding leaves as it is comes back borrowed. One with nothing
+/// to decode (no `%`, and no `+` when it is a space) is not copied at all.
+fn url_decode_fully(input: &str, plus_is_space: bool) -> Cow<'_, str> {
+    if !input
+        .bytes()
+        .any(|b| b == b'%' || (plus_is_space && b == b'+'))
+    {
+        return Cow::Borrowed(input);
+    }
+    let mut current = url_decode(input, plus_is_space);
+    for _ in 1..3 {
         let next = url_decode(&current, plus_is_space);
         if next == current {
             break;
         }
         current = next;
     }
-    current
+    if current == input {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(current)
+    }
 }
 
 #[cfg(test)]
@@ -935,6 +963,40 @@ mod tests {
         assert!(
             clean.is_empty(),
             "clean query produced detections: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn test_url_decode_fully_borrows_what_it_does_not_change() {
+        assert!(matches!(url_decode_fully("plain", true), Cow::Borrowed(_)));
+        assert!(matches!(url_decode_fully("a+b", false), Cow::Borrowed(_)));
+        assert!(matches!(url_decode_fully("100%", true), Cow::Borrowed(_)));
+        assert!(matches!(url_decode_fully("a+b", true), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_body_rule_matching_both_forms_counts_once() {
+        let engine = test_engine();
+        // The tag matches as sent and again once decoded; the encoded quote
+        // matches only once decoded.
+        let body = "comment=<script>alert(1)</script>&id=1%27%20OR%20%271%27%3D%271";
+        let raw: Vec<u32> = engine
+            .check(body, "body")
+            .iter()
+            .map(|d| d.rule_id)
+            .collect();
+        assert!(!raw.is_empty());
+        let ids: Vec<u32> = engine.check_body(body).iter().map(|d| d.rule_id).collect();
+        for id in &raw {
+            assert_eq!(
+                ids.iter().filter(|i| *i == id).count(),
+                raw.iter().filter(|i| *i == id).count(),
+                "rule {id} counted again for the decoded form: {ids:?}"
+            );
+        }
+        assert!(
+            ids.iter().any(|id| !raw.contains(id)),
+            "no rule matched only the decoded form: {ids:?}"
         );
     }
     use super::*;

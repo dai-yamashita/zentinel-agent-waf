@@ -504,6 +504,180 @@ async fn test_body_inspection_disabled_allows_attack() {
     assert!(is_allow(&response.decision), "Expected Allow decision");
 }
 
+// ============================================================================
+// Percent-encoded header values and bodies
+// ============================================================================
+
+/// Form bodies carrying payloads the way a browser or curl sends them:
+/// percent-encoded, with `+` for spaces, and once double-encoded.
+const ENCODED_FORM_PAYLOADS: &[&str] = &[
+    "user=admin&id=1%27%20OR%20%271%27%3D%271",
+    "user=admin&id=1%27+OR+%271%27%3D%271",
+    "comment=%3Cscript%3Ealert(document.cookie)%3C%2Fscript%3E",
+    "user=admin&id=1%2527%2520OR%2520%25271%2527%253D%25271",
+];
+
+/// Form bodies with encoded values and nothing to block.
+const ENCODED_FORM_CLEAN: &[&str] = &[
+    "name=John+Smith&comment=Hello%2C+world%21",
+    "q=red%20shoes&size=42&tags=a%2Bb%2Cc",
+];
+
+/// Send the headers of a request with `headers`, then `body` (if any) as one
+/// last chunk, and return the decision on the last event sent.
+async fn decide(
+    config: WafConfig,
+    headers: HashMap<String, Vec<String>>,
+    body: Option<&str>,
+) -> Decision {
+    let (_dir, socket_path) = start_test_server(config).await;
+    let client = create_client(&socket_path).await;
+
+    let headers_event = make_request_headers("/login", headers);
+    let response = client
+        .send_request_headers(&headers_event.metadata.correlation_id, &headers_event)
+        .await
+        .expect("Failed to send headers event");
+    let Some(body) = body else {
+        return response.decision;
+    };
+    assert!(
+        is_allow(&response.decision),
+        "Expected Allow for the headers"
+    );
+
+    let body_event = make_body_chunk(&headers_event.metadata.correlation_id, body, true);
+    client
+        .send_request_body_chunk(&body_event.correlation_id, &body_event)
+        .await
+        .expect("Failed to send body event")
+        .decision
+}
+
+fn streaming_config() -> WafConfig {
+    let mut config = WafConfig::default();
+    config.streaming.enabled = true;
+    config
+}
+
+#[tokio::test]
+async fn test_percent_encoded_form_body_blocked() {
+    for body in ENCODED_FORM_PAYLOADS {
+        let decision = decide(WafConfig::default(), HashMap::new(), Some(body)).await;
+        assert!(is_block(&decision), "Expected Block for body {body:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_percent_encoded_form_body_blocked_in_streaming_mode() {
+    for body in ENCODED_FORM_PAYLOADS {
+        let decision = decide(streaming_config(), HashMap::new(), Some(body)).await;
+        assert!(is_block(&decision), "Expected Block for body {body:?}");
+    }
+}
+
+/// A JSON body with a base64 value, so with many `+`: decoding reads each
+/// `+` as a space, and the result must still pass.
+fn json_with_base64() -> String {
+    let bytes: Vec<u8> = (0..20_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    assert!(data.matches('+').count() > 100);
+    format!(r#"{{"file": "{data}", "note": "C++ and a+b=c"}}"#)
+}
+
+#[tokio::test]
+async fn test_percent_encoded_clean_bodies_allowed() {
+    let json = json_with_base64();
+    let bodies = ENCODED_FORM_CLEAN.iter().copied().chain([json.as_str()]);
+    for body in bodies {
+        for config in [WafConfig::default(), streaming_config()] {
+            let decision = decide(config, HashMap::new(), Some(body)).await;
+            assert!(
+                is_allow(&decision),
+                "Expected Allow for body {:?}",
+                &body[..body.len().min(80)]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_escape_split_across_streaming_chunks_detected() {
+    // Neither chunk matches on its own; the escape `%20` is cut after `%2`,
+    // and the overlap carries it into the inspection of the next chunk.
+    let (_dir, socket_path) = start_test_server(streaming_config()).await;
+    let client = create_client(&socket_path).await;
+
+    let headers_event = make_request_headers("/login", HashMap::new());
+    let id = headers_event.metadata.correlation_id.clone();
+    client
+        .send_request_headers(&id, &headers_event)
+        .await
+        .expect("Failed to send headers event");
+
+    let first = make_body_chunk(&id, "id=1%20UNION%2", false);
+    let response = client
+        .send_request_body_chunk(&id, &first)
+        .await
+        .expect("Failed to send chunk 1");
+    assert!(is_allow(&response.decision), "Expected Allow for chunk 1");
+
+    let last = make_body_chunk(&id, "0SELECT%20username%2Cpassword%20FROM%20users", true);
+    let response = client
+        .send_request_body_chunk(&id, &last)
+        .await
+        .expect("Failed to send chunk 2");
+    // The one rule that matches scores below the block threshold, so the
+    // request is passed upstream marked with it.
+    assert!(is_allow(&response.decision), "Expected Allow for chunk 2");
+    let detected = response.request_headers.iter().any(|h| match h {
+        zentinel_agent_protocol::HeaderOp::Set { name, value } => {
+            name == "X-WAF-Detected" && value.split(',').any(|id| id.trim() == "942100")
+        }
+        _ => false,
+    });
+    assert!(
+        detected,
+        "Expected rule 942100 once the escape is whole: {:?}",
+        response.request_headers
+    );
+}
+
+#[tokio::test]
+async fn test_percent_encoded_header_values_blocked() {
+    for (name, value) in [
+        ("Cookie", "session=abc; id=1%27%20OR%20%271%27%3D%271"),
+        (
+            "Referer",
+            "https://shop.example/search?q=%3Cscript%3Ealert(document.cookie)%3C%2Fscript%3E",
+        ),
+    ] {
+        let headers = HashMap::from([(name.to_string(), vec![value.to_string()])]);
+        let decision = decide(WafConfig::default(), headers, None).await;
+        assert!(is_block(&decision), "Expected Block for {name}: {value}");
+    }
+}
+
+#[tokio::test]
+async fn test_percent_encoded_clean_header_values_allowed() {
+    for (name, value) in [
+        ("Cookie", "prefs=lang%3Den%26theme%3Ddark; session=abc"),
+        ("Referer", "https://shop.example/search?q=red%20shoes"),
+        // `%XX` is decoded in a header, `+` is not.
+        ("Cookie", "tok=a+b%3Dc; session=dXNlcjpwYXNz+w%3D%3D"),
+        ("Authorization", "Basic dXNlcjpwYXNz+w=="),
+        // Not blocked on its own, as the same URL unencoded in a Referer is
+        // not.
+        ("Cookie", "return_to=http%3A%2F%2Flocalhost%3A3000%2Fcb"),
+    ] {
+        let headers = HashMap::from([(name.to_string(), vec![value.to_string()])]);
+        let decision = decide(WafConfig::default(), headers, None).await;
+        assert!(is_allow(&decision), "Expected Allow for {name}: {value}");
+    }
+}
+
 #[tokio::test]
 async fn test_body_exceeds_max_size_skips_inspection() {
     let config = WafConfig {

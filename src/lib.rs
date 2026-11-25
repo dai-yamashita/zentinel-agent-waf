@@ -884,7 +884,7 @@ impl AgentHandlerV2 for WafAgent {
                             "Inspecting request body (buffered mode)"
                         );
 
-                        let detections = engine.check(&body_str, "body");
+                        let detections = engine.check_body(&body_str);
                         let (decision, detections) =
                             self.make_decision(&engine, detections, "body");
                         if !decision.is_block() {
@@ -941,7 +941,7 @@ impl AgentHandlerV2 for WafAgent {
                 // Prepare chunk for inspection (includes overlap from previous chunk)
                 if let Some(inspection_text) = inspector.prepare_chunk(&chunk) {
                     // Inspect the chunk
-                    let detections = engine.check(&inspection_text, "body");
+                    let detections = engine.check_body(&inspection_text);
 
                     // Add detections and check for early termination
                     let location_weight = engine.config.scoring.location_weights.body;

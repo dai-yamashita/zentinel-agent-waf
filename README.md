@@ -228,6 +228,15 @@ XPath injection, SSRF, insecure deserialization, protocol attacks, request
 smuggling and scanner detection. Patterns are grouped into regex automata, so a
 value is matched against a group at once rather than rule by rule.
 
+**Decoding.** The path, query string, header values and request body are each
+matched as sent and, when it differs, percent-decoded (double encoding is
+unwrapped up to three rounds). In the query string and in any request body,
+whatever its `Content-Type`, `+` is also read as a space, as in a form. In the
+path and in headers it is left as it is. A rule that matches both forms of a
+value counts once. In streaming mode each chunk is decoded together with its
+overlap, which is counted in bytes as sent. Response bodies and WebSocket
+frames are matched as sent.
+
 **Scoring.** Each match contributes its rule's score times a severity
 multiplier and a location weight:
 
